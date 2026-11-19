@@ -288,6 +288,22 @@ def nullify(*args, **kwargs):
     pass
 
 
+def dedupe(items, case_insensitive=False):
+    """
+    removes duplicate entries while preserving the first occurrence
+    returns list
+    """
+    seen = set()
+    result = []
+    for item in items:
+        key = item.lower() if case_insensitive else item
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result
+
+
 def dict_to_xml(dict_obj):
     """
     converts dict to xml string

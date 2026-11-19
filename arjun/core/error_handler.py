@@ -3,6 +3,14 @@ import time
 import arjun.core.config as mem
 
 from arjun.core.colors import bad
+from arjun.core.ratelimiter import limiter
+
+
+def penalize(cooldown):
+	rate = limiter()
+	if rate is not None:
+		return rate.penalty(cooldown)
+	return cooldown
 
 
 def connection_refused():
@@ -32,9 +40,11 @@ def error_handler(response, factors):
 			return 'ok'
 		if response.status_code == 503:
 			mem.var['kill'] = True
+			penalize(5)
 			print('%s Target is unable to process requests, try --stable switch' % bad)
 			return 'kill'
 		elif response.status_code in (429, 418):
+			penalize(5)
 			print('%s Target has a rate limit in place, try --stable switch' % bad)
 			return 'kill'
 		else:
@@ -54,10 +64,12 @@ def error_handler(response, factors):
 				print('%s Target might have a rate limit in place, try --stable switch' % bad)
 				return 'kill'
 			else:
+				penalize(2)
 				print('%s Connection timed out, increased timeout by 5 seconds' % bad)
 				mem.var['timeout'] += 5
 				return 'retry'
 		elif 'ConnectionRefused' in response:
+			penalize(3)
 			return connection_refused()
 		elif type(response) == str:
 			if '\'' in response:

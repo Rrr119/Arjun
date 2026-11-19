@@ -1,3 +1,10 @@
+#### Unreleased
+- Added `--adaptive` option to scan frequency tiers (small/medium/large) in order and stop early once parameters are confirmed
+- Added `--max-requests` hard cap on HTTP requests per target and per-target request count reporting
+- Replaced the external `ratelimit` dependency with a built-in thread-safe sliding window limiter and adaptive backoff on 429/418/503/timeouts
+- Added `--ignore-case` and order-preserving deduplication for wordlists and confirmed parameters
+- Added large wordlist timing tests and `tests/bench_large_wordlist.py` benchmark
+
 #### 2.2.7
 - Added `--casing` option for casing style enforcement
 - Added `--ratelimit` option for explicitly defining requests/second

@@ -47,6 +47,23 @@ The best part? It takes less than 10 seconds to go through this huge list while 
 - Import targets from: BurpSuite, text file or a raw request file
 - Can passively extract parameters from JS or 3 external sources
 
+### Controlling request volume
+
+Parameter discovery should never flood a target. Arjun provides three switches to keep request volume predictable:
+
+- `--adaptive`: splits the bundled wordlist into frequency tiers (high-frequency names first, then the medium list and the long tail) and scans them in order. As soon as a tier yields confirmed parameters the remaining tiers are skipped. On the local benchmark this finds the same parameters with ~74% fewer requests.
+- `--rate-limit N`: caps outgoing traffic to N requests per rolling second through a built-in thread-safe sliding window limiter. On HTTP 429/418/503 or timeouts the limiter applies an adaptive cooldown that doubles on repeated throttling.
+- `--max-requests N`: a hard per-target budget; once reached the scan stops cleanly and reports that the budget was exhausted. The number of requests actually sent is printed after every target.
+
+Confirmed parameter names are always deduplicated while preserving their first occurrence; add `--ignore-case` to treat differently cased names (`Id` vs `id`) as duplicates.
+
+The large wordlist (25,890 names) is covered by offline tests using a local HTTP server:
+
+```
+python -m pytest tests/                      # functional + timing/budget assertions
+python tests/bench_large_wordlist.py         # full vs adaptive request/time comparison
+```
+
 ### Installing Arjun
 The recommended way to install `arjun` is as following:
 ```

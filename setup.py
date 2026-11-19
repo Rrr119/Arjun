@@ -24,8 +24,7 @@ setup(
     package_data={'arjun': ['db/*']},
     install_requires=[
         'requests',
-        'dicttoxml',
-        'ratelimit'
+        'dicttoxml'
     ],
     classifiers=[
         'Development Status :: 5 - Production/Stable',

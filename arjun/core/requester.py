@@ -6,27 +6,34 @@ import warnings
 
 import arjun.core.config as mem
 
-from ratelimit import limits, sleep_and_retry
+from arjun.core.ratelimiter import limiter
 from arjun.core.utils import dict_to_xml
 
 warnings.filterwarnings('ignore') # Disable SSL related warnings
 
 
-@sleep_and_retry
-@limits(calls=mem.var['rate_limit'], period=1)
 def requester(request, payload={}):
     """
     central function for making http requests
     returns str on error otherwise response object of requests library
     """
+    if mem.var['kill']:
+        return 'killed'
+    budget = mem.var.get('max_requests', 0)
+    if budget and mem.var.get('request_count', 0) >= budget:
+        mem.var['kill'] = True
+        mem.var['budget_exhausted'] = True
+        return 'killed'
+    rate = limiter()
+    if rate is not None:
+        rate.acquire()
+    mem.var['request_count'] = mem.var.get('request_count', 0) + 1
     if request.get('include') and len(request.get('include', '')) != 0:
         payload.update(request['include'])
     if mem.var['stable']:
         mem.var['delay'] = random.choice(range(3, 10))
     time.sleep(mem.var['delay'])
     url = request['url']
-    if mem.var['kill']:
-        return 'killed'
     try:
         if request['method'] == 'GET':
             response = requests.get(url,

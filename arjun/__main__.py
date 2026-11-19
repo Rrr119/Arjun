@@ -10,7 +10,9 @@ from urllib.parse import urlparse
 import arjun.core.config as mem
 from arjun.core.exporter import exporter
 from arjun.core.anomaly import define, compare
-from arjun.core.utils import fetch_params, stable_request, random_str, slicer, confirm, populate, reader, nullify, prepare_requests, compatible_path
+from arjun.core.utils import fetch_params, stable_request, random_str, slicer, confirm, populate, reader, nullify, prepare_requests, compatible_path, dedupe
+from arjun.core.ratelimiter import configure as configure_rate
+from arjun.core.adaptive import tier_plan
 
 from arjun.plugins.heuristic import heuristic
 from arjun.plugins.wl import detect_casing, covert_to_case
@@ -38,16 +40,9 @@ parser.add_argument('--stable', help='Prefer stability over speed.', dest='stabl
 parser.add_argument('--include', help='Include this data in every request.', dest='include', default={})
 parser.add_argument('--disable-redirects', help='disable redirects', dest='disable_redirects', action='store_true')
 parser.add_argument('--casing', help='casing style for params e.g. like_this, likeThis, likethis', dest='casing')
-args = parser.parse_args() # arguments to be parsed
-
-if args.quiet:
-    print = nullify
-
-print('''%s    _
-   /_| _ '
-  (  |/ /(//) v%s
-      _/      %s
-''' % (green, __import__('arjun').__version__, end))
+parser.add_argument('--adaptive', help='Scan frequency tiers in order and stop early once parameters are confirmed.', dest='adaptive', action='store_true')
+parser.add_argument('--max-requests', help='Hard cap on HTTP requests per target, 0 means unlimited. (default: 0)', dest='max_requests', type=int, default=0)
+parser.add_argument('--ignore-case', help='Deduplicate parameter names case-insensitively.', dest='ignore_case', action='store_true')
 
 try:
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -55,19 +50,17 @@ except ImportError:
     print('%s Please use Python > 3.2 to run Arjun.' % bad)
     quit()
 
-mem.var = vars(args)
+from arjun.core.requester import requester
+from arjun.core.bruter import bruter
 
-mem.var['method'] = mem.var['method'].upper()
 
-if mem.var['method'] != 'GET':
-    mem.var['chunks'] = 500
-
-if mem.var['stable'] or mem.var['delay']:
-    mem.var['threads'] = 1
-if mem.var['wordlist'] in ('large', 'medium', 'small'):
-    mem.var['wordlist'] = f'{arjun_dir}/db/{mem.var["wordlist"]}.txt'
-
-try:
+def load_wordlist(args):
+    """
+    loads and normalizes the configured parameter wordlist
+    returns list of unique parameter names
+    """
+    if mem.var['wordlist'] in ('large', 'medium', 'small'):
+        mem.var['wordlist'] = f'{arjun_dir}/db/{mem.var["wordlist"]}.txt'
     wordlist_file = arjun_dir + '/db/small.txt' if args.wordlist == 'small' else args.wordlist
     wordlist_file = compatible_path(wordlist_file)
     wordlist = set(reader(wordlist_file, mode='lines'))
@@ -84,17 +77,8 @@ try:
         wordlist = [covert_to_case(word, delimiter, casing) for word in wordlist]
     else:
         wordlist = list(wordlist)
-except FileNotFoundError:
-    exit('%s The specified file for parameters doesn\'t exist' % bad)
+    return dedupe(wordlist)
 
-if len(wordlist) < mem.var['chunks']:
-    mem.var['chunks'] = int(len(wordlist)/2)
-
-if not args.url and not args.import_file:
-    exit('%s No target(s) specified' % bad)
-
-from arjun.core.requester import requester
-from arjun.core.bruter import bruter
 
 def narrower(request, factors, param_groups):
     """
@@ -113,11 +97,48 @@ def narrower(request, factors, param_groups):
     return anomalous_params
 
 
-def initialize(request, wordlist, single_url=False):
+def scan_tier(request, factors, zzuf, active_words, special_loaded, last_params):
+    """
+    runs the chunk-narrowing and verification loop for one wordlist tier
+    returns (param_names, special_loaded)
+    """
+    populated = populate(active_words)
+    if not special_loaded:
+        with open(f'{arjun_dir}/db/special.json', 'r') as f:
+            populated.update(json.load(f))
+        special_loaded = True
+    group_count = max(1, int(len(active_words)/mem.var['chunks']))
+    param_groups = slicer(populated, group_count)
+    prev_chunk_count = len(param_groups)
+    while True:
+        param_groups = narrower(request, factors, param_groups)
+        if len(param_groups) > prev_chunk_count:
+            response_3 = requester(request, {zzuf[:-1]: zzuf[::-1][:-1]})
+            if compare(response_3, factors, {zzuf[:-1]: zzuf[::-1][:-1]})[0] != '':
+                print('%s Webpage is returning different content on each request. Skipping.' % bad)
+                return [], special_loaded
+        if mem.var['kill']:
+            break
+        param_groups = confirm(param_groups, last_params)
+        prev_chunk_count = len(param_groups)
+        if not param_groups:
+            break
+    tier_params = []
+    for param in last_params:
+        reason = bruter(request, factors, param, mode='verify')
+        if reason:
+            name = list(param.keys())[0]
+            tier_params.append(name)
+            print('%s parameter detected: %s, based on: %s' % (res, name, reason))
+    return tier_params, special_loaded
+
+
+def initialize(request, wordlist_tiers, single_url=False):
     """
     handles parameter finding process for a single request object
     returns 'skipped' (on error), list on success
     """
+    wordlist = [word for tier in wordlist_tiers for word in tier]
     url = request['url']
     if not url.startswith('http'):
         print('%s %s is not a valid URL' % (bad, url))
@@ -142,7 +163,7 @@ def initialize(request, wordlist, single_url=False):
             return 'skipped'
 
         # params from response must be extracted before factors but displayed later
-        found, words_exist = heuristic(response_1, wordlist)
+        found, words_exist = heuristic(response_1, wordlist_tiers[0])
 
         factors = define(response_1, response_2, fuzz, fuzz[::-1], wordlist)
         zzuf = "z" + random_str(6)
@@ -159,39 +180,65 @@ def initialize(request, wordlist, single_url=False):
             else:
                 s = 's' if num > 1 else ''
                 print('%s Extracted %i parameter%s from response for testing: %s' % (good, num, s, ', '.join(found)))
-        if single_url:
-            print('%s Logicforcing the URL endpoint' % run)
-        populated = populate(wordlist)
-        with open(f'{arjun_dir}/db/special.json', 'r') as f:
-            populated.update(json.load(f))
-        param_groups = slicer(populated, int(len(wordlist)/mem.var['chunks']))
-        prev_chunk_count = len(param_groups)
         last_params = []
-        while True:
-            param_groups = narrower(request, factors, param_groups)
-            if len(param_groups) > prev_chunk_count:
-                response_3 = requester(request, {zzuf[:-1]: zzuf[::-1][:-1]})
-                if compare(response_3, factors, {zzuf[:-1]: zzuf[::-1][:-1]})[0] != '':
-                    print('%s Webpage is returning different content on each request. Skipping.' % bad)
-                    return []
-            if mem.var['kill']:
-                return 'skipped'
-            param_groups = confirm(param_groups, last_params)
-            prev_chunk_count = len(param_groups)
-            if not param_groups:
-                break
         confirmed_params = []
-        for param in last_params:
-            reason = bruter(request, factors, param, mode='verify')
-            if reason:
-                name = list(param.keys())[0]
-                confirmed_params.append(name)
-                if single_url:
-                    print('%s parameter detected: %s, based on: %s' % (res, name, reason))
+        special_loaded = False
+        tier_total = len(wordlist_tiers)
+        for index, active_words in enumerate(wordlist_tiers, start=1):
+            if single_url:
+                label = 'tier %i/%i' % (index, tier_total) if mem.var.get('adaptive') else 'endpoint'
+                print('%s Logicforcing the URL endpoint (%s, %i names)' % (run, label, len(active_words)))
+            tier_params, special_loaded = scan_tier(
+                request, factors, zzuf, active_words, special_loaded, last_params
+            )
+            confirmed_params.extend(tier_params)
+            if mem.var['kill']:
+                break
+            if tier_params and mem.var.get('adaptive'):
+                print('%s Parameters confirmed in tier %i, stopping remaining tiers to save requests' % (info, index))
+                break
+        confirmed_params = dedupe(confirmed_params, mem.var.get('ignore_case', False))
+        if mem.var['kill'] and not confirmed_params:
+            return 'skipped'
         return confirmed_params
 
 
 def main():
+    args = parser.parse_args() # arguments to be parsed
+
+    if args.quiet:
+        global print
+        print = nullify
+
+    print('''%s    _
+   /_| _ '
+  (  |/ /(//) v%s
+      _/      %s
+''' % (green, __import__('arjun').__version__, end))
+
+    mem.var = vars(args)
+    mem.var['method'] = mem.var['method'].upper()
+    configure_rate(mem.var['rate_limit'])
+    mem.var['request_count'] = 0
+    mem.var['budget_exhausted'] = False
+
+    if mem.var['method'] != 'GET':
+        mem.var['chunks'] = 500
+    if mem.var['stable'] or mem.var['delay']:
+        mem.var['threads'] = 1
+
+    try:
+        wordlist = load_wordlist(args)
+    except FileNotFoundError:
+        exit('%s The specified file for parameters doesn\'t exist' % bad)
+
+    if len(wordlist) < mem.var['chunks']:
+        mem.var['chunks'] = max(1, int(len(wordlist)/2))
+    wordlist_tiers = tier_plan(wordlist)
+
+    if not args.url and not args.import_file:
+        exit('%s No target(s) specified' % bad)
+
     requests = prepare_requests(args)
 
     final_result = {}
@@ -203,13 +250,20 @@ def main():
         for request in requests:
             url = request['url']
             print('%s Scanning %d/%d: %s' % (run, count, len(requests), url))
-            these_params = initialize(request, wordlist, single_url=is_single)
+            mem.var['request_count'] = 0
+            mem.var['budget_exhausted'] = False
+            these_params = initialize(request, wordlist_tiers, single_url=is_single)
             count += 1
             mem.var['kill'] = False
             mem.var['bad_req_count'] = 0
+            print('%s Requests sent: %i' % (info, mem.var['request_count']))
             if these_params == 'skipped':
-                print('%s Skipped %s due to errors' % (bad, url))
+                if mem.var.get('budget_exhausted'):
+                    print('%s Stopped %s, --max-requests budget of %i exhausted' % (bad, url, mem.var['max_requests']))
+                else:
+                    print('%s Skipped %s due to errors' % (bad, url))
             elif these_params:
+                these_params = dedupe(these_params, mem.var.get('ignore_case', False))
                 final_result[url] = {}
                 final_result[url]['params'] = these_params
                 final_result[url]['method'] = request['method']
